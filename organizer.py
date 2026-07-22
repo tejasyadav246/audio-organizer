@@ -1,91 +1,144 @@
-"""
-Audio Library Organizer & Tagger
-----------------------------------
-Scans a folder of audio files (mp3, wav, flac), reads their metadata
-(artist, title, genre, duration, bitrate), and organizes them into a
-clean folder structure: Organized/<Artist>/<Genre>/<Title>.ext
-
-If metadata is missing, files are sorted into an "Unknown" bucket
-instead of crashing — real-world audio libraries are messy.
-
-Usage:
-    python organizer.py /path/to/messy/music/folder
-"""
-
 import os
-import shutil
 import sys
-from mutagen import File as MutagenFile
-
-SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a"}
-
-
-def read_metadata(filepath):
-    """Extract artist, title, genre, duration, and bitrate from an audio file."""
-    audio = MutagenFile(filepath, easy=True)
-
-    if audio is None:
-        return None
-
-    tags = audio.tags or {}
-    artist = tags.get("artist", ["Unknown Artist"])[0]
-    title = tags.get("title", [os.path.splitext(os.path.basename(filepath))[0]])[0]
-    genre = tags.get("genre", ["Unknown Genre"])[0]
-
-    duration = getattr(audio.info, "length", 0)
-    bitrate = getattr(audio.info, "bitrate", 0)
-
-    return {
-        "artist": sanitize(artist),
-        "title": sanitize(title),
-        "genre": sanitize(genre),
-        "duration": duration,
-        "bitrate": bitrate,
-    }
+import shutil
+import argparse
+from pathlib import Path
+from mutagen import File
+from mutagen.id3 import ID3NoHeaderError
 
 
-def sanitize(name):
-    """Remove characters that aren't safe for folder/file names."""
+def format_duration(seconds):
+    """Converts seconds to M:SS string format."""
+    if not seconds:
+        return "0:00"
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{mins}:{secs:02d}"
+
+
+def get_metadata(file_path):
+    """
+    Reads embedded metadata from .mp3, .wav, .flac, .m4a, etc.
+    Falls back gracefully to sensible defaults if tags are missing.
+    """
+    artist = "Unknown Artist"
+    title = file_path.stem
+    genre = "Uncategorized"
+    duration_str = "0:00"
+    bitrate_kbps = 0
+
+    try:
+        audio = File(file_path, easy=True)
+        
+        if audio is not None:
+            # Extract basic tags if available
+            if "artist" in audio and audio["artist"]:
+                artist = audio["artist"][0].strip()
+            elif "performer" in audio and audio["performer"]:
+                artist = audio["performer"][0].strip()
+
+            if "title" in audio and audio["title"]:
+                title = audio["title"][0].strip()
+
+            if "genre" in audio and audio["genre"]:
+                genre = audio["genre"][0].strip()
+
+            # Extract technical audio properties
+            if hasattr(audio, "info") and audio.info:
+                if hasattr(audio.info, "length"):
+                    duration_str = format_duration(audio.info.length)
+                if hasattr(audio.info, "bitrate") and audio.info.bitrate:
+                    bitrate_kbps = int(audio.info.bitrate / 1000)
+
+    except (ID3NoHeaderError, Exception):
+        # Fail-safe: Keep default values if metadata reading fails
+        pass
+
+    # Sanitize strings to avoid invalid folder/file path characters
     invalid_chars = '<>:"/\\|?*'
-    for ch in invalid_chars:
-        name = name.replace(ch, "")
-    return name.strip() or "Unknown"
+    for char in invalid_chars:
+        artist = artist.replace(char, "")
+        genre = genre.replace(char, "")
+        title = title.replace(char, "")
+
+    return artist, title, genre, duration_str, bitrate_kbps
 
 
-def organize_folder(source_folder, output_folder="Organized"):
-    scanned, moved, skipped = 0, 0, 0
+def organize_library(source_dir, output_dir, move_files=False, dry_run=False):
+    """
+    Scans source directory for audio files and organizes them into
+    an Organized/Artist/Genre/Title.ext directory tree.
+    """
+    source_path = Path(source_dir)
+    output_path = Path(output_dir)
 
-    for filename in os.listdir(source_folder):
-        ext = os.path.splitext(filename)[1].lower()
-        if ext not in SUPPORTED_EXTENSIONS:
-            continue
+    if not source_path.exists():
+        print(f"Error: Source directory '{source_dir}' does not exist.")
+        sys.exit(1)
 
-        scanned += 1
-        filepath = os.path.join(source_folder, filename)
-        meta = read_metadata(filepath)
+    supported_extensions = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aiff"}
+    
+    scanned_count = 0
+    organized_count = 0
+    skipped_count = 0
 
-        if meta is None:
-            print(f"  [skip] Could not read metadata: {filename}")
-            skipped += 1
-            continue
+    print(f"\nScanning: {source_path.resolve()}")
+    if dry_run:
+        print("--- RUNNING IN DRY-RUN MODE (No files will be moved/copied) ---\n")
+    else:
+        print("-----------------------------------------------------------\n")
 
-        dest_dir = os.path.join(output_folder, meta["artist"], meta["genre"])
-        os.makedirs(dest_dir, exist_ok=True)
+    for root, _, files in os.walk(source_path):
+        for file in files:
+            file_path = Path(root) / file
+            
+            # Skip files if they are already inside the destination directory
+            if output_path.resolve() in file_path.resolve().parents:
+                continue
 
-        dest_path = os.path.join(dest_dir, f"{meta['title']}{ext}")
-        shutil.copy2(filepath, dest_path)
-        moved += 1
+            if file_path.suffix.lower() in supported_extensions:
+                scanned_count += 1
+                artist, title, genre, duration, bitrate = get_metadata(file_path)
 
-        mins, secs = divmod(int(meta["duration"]), 60)
-        print(f"  [ok] {filename} -> {dest_path}  "
-              f"({mins}:{secs:02d}, {meta['bitrate']//1000 if meta['bitrate'] else 0}kbps)")
+                # Construct new folder hierarchy: Output/Artist/Genre/Title.ext
+                dest_dir = output_path / artist / genre
+                dest_file = dest_dir / f"{title}{file_path.suffix.lower()}"
 
-    print(f"\nScanned {scanned} files | Organized {moved} | Skipped {skipped}")
+                action_str = "move" if move_files else "copy"
+                rel_dest = dest_file.relative_to(output_path.parent) if output_path.parent in dest_file.parents else dest_file
+
+                try:
+                    if not dry_run:
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        if move_files:
+                            shutil.move(str(file_path), str(dest_file))
+                        else:
+                            shutil.copy2(str(file_path), str(dest_file))
+
+                    print(f"[ok] {file_path.name} -> {rel_dest}  ({duration}, {bitrate}kbps)")
+                    organized_count += 1
+
+                except Exception as e:
+                    print(f"[ERROR] Failed to {action_str} {file_path.name}: {e}")
+                    skipped_count += 1
+
+    print(f"\nScanned {scanned_count} files | Organized {organized_count} | Skipped {skipped_count}\n")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python organizer.py <folder_of_audio_files>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Organize messy audio files into a clean Artist/Genre directory structure using embedded ID3 metadata."
+    )
+    parser.add_argument("source", type=str, help="Path to messy source audio directory")
+    parser.add_argument(
+        "--output", "-o", type=str, default="Organized", help="Destination directory name (Default: 'Organized')"
+    )
+    parser.add_argument(
+        "--move", "-m", action="store_true", help="Move files instead of copying them"
+    )
+    parser.add_argument(
+        "--dry-run", "-d", action="store_true", help="Simulate the organization process without modifying files"
+    )
 
-    organize_folder(sys.argv[1])
+    args = parser.parse_args()
+    organize_library(args.source, args.output, move_files=args.move, dry_run=args.dry_run)
